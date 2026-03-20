@@ -6,7 +6,7 @@ metadata:
 
 spec:
   addresses:
-  - 10.0.0.10-10.0.0.11
+  - 10.0.0.7-10.0.0.8
 
   autoAssign: true
 

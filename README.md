@@ -294,6 +294,7 @@ $ helm install metallb metallb/metallb --namespace metallb-system --create-names
 ```
 
 Verify our metallb release.
+We have 2 speaker pods, each running on each node.
 
 ```bash
 $ kubectl get all -n metallb-system
@@ -314,7 +315,7 @@ metadata:
 
 spec:
   addresses:
-  - 10.0.0.8/32
+  - 10.0.0.7-10.0.0.8
 
   autoAssign: true
 
@@ -365,3 +366,268 @@ Check if loadbalancer service is reachable
 Verify our application deployment.
 
 ![alt](screenshots/2026-03-17-103954_955x279_scrot.png)
+
+## Configure SSL with cert-manager
+
+### Install cert-manager using helm
+
+We can install cert-manager in our cluster using helm.
+
+Firstly we need to add the repository.
+
+```sh
+$ helm repo add jetstack https://charts.jetstack.io
+$ helm repo update
+```
+
+We can now install cert-manager in cert-manager namespace.
+
+```sh
+$ helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --version v1.20.0 \
+  --set crds.enabled=true
+``` 
+
+Verify the installation
+
+```sh
+$ kubectl get all -n cert-manager
+```
+
+![alt](screenshots/2026-03-19-194708_1196x482_scrot.png)
+
+
+### Configure Issuer
+
+An Issuer tells cert-manager on how to request TLS certificates.Issuers are specific to a namespace, while ClusterIssuers are cluster-wide version.ClusterIssuer resource apply across all ingress resources in the cluster.
+
+Here we will create `ClusterIssuer`.
+
+We will create two Issuers for Lets Encrypt.
+- staging
+- production
+This is because production issuer has strict rate limits, thats why we can use staging to ensure everything is working as expected then we can switch to production.
+
+Using staging issuer will cause warnings about `untrusted certificates`.That is normal.
+
+`http01` challenge is to test existence of the server.
+The cert-manager will create a ingress resource to validate the domain.
+
+Here we will create the staging ClusterIssuer resource.
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+
+    email: <your-email-id>
+
+    profile: tlsserver
+
+    privateKeySecretRef:
+      name: letsencrypt-staging-acme-account
+
+    solvers:
+    - http01:
+        ingress:
+          ingressClassName: nginx
+```
+
+We will also create the production ClusterIssuer resource.
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+
+    email: <your-email-id>
+
+    profile: tlsserver
+
+    privateKeySecretRef:
+      name: letsencrypt-prod
+
+    solvers:
+    - http01:
+        ingress:
+          ingressClassName: nginx
+```
+
+### Update ingress
+
+We will now edit our ingress resource in our `dev` namespace.
+
+We will add the following to our ingress:
+
+Add the annotation under the metadata:
+
+```yaml
+annotations:
+  cert-manager.io/issuer: "letsencrypt-staging"
+```
+
+Under `spec` add the following:
+
+```yaml
+tls:
+  - hosts:
+    - virtual-swan.webhop.me
+    secretName: tls-secret
+```
+Cert-manager will see these annotations on the ingress resource and use it to request a certificate.
+
+After validation the certificate will be issued, which we can see.
+
+```sh
+$ kubectl get certificate tls-secret -n dev
+```
+
+![alt](screenshots/2026-03-19-205918_875x69_scrot.png)
+
+Since everything is working as expected, we can now use the production issuer.
+
+We now need to update the annotation in our ingress resource.
+
+```yaml
+annotations:
+  cert-manager.io/issuer: "letsencrypt-prod"
+```
+We need to delete the secret that cert-manager is watching to reprocess the certificate creation, using the updated ingress resource.
+
+```sh
+$ kubectl delete secret tls-secret -n dev 
+```
+
+This will start the process of getting a new certificate.
+After certificate is issued we can view the certificate.
+
+```sh
+$ kubectl describe secret tls-secret -n dev
+```
+
+![alt](screenshots/2026-03-19-210441_870x449_scrot.png)
+
+### Test HTTPS access
+
+We can now access our application using HTTPS.
+
+Before that we need to port-forward to our ingress on local port 443(https) and ingress service port 443(https)
+
+```sh
+$ kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx 443:443 --address 10.0.0.5
+```
+
+Now we can view our application in browser or terminal.
+
+![alt](screenshots/2026-03-19-213944_613x43_scrot.png)
+
+![alt](screenshots/2026-03-19-214035_347x166_scrot.png)
+
+### Configure auto renewal
+
+The auto renewal of certificates is configured by default with an duration of 90 days and renewal starts 30 days before expiry.
+
+```sh
+$ kubectl describe certificate tls-secret -n dev -o yaml
+```
+
+![alt](screenshots/2026-03-19-220242_704x286_scrot.png)
+
+## Create CICD Pipeline
+
+We are going to create a CICD pipeline for our application using Github Actions.
+
+### Create a application repository
+
+We need to create an application repository with our application code and helm chart in it.
+
+[repository link](https://github.com/suvham-ini8labs/go-app)
+
+### Create a workflow file
+
+Under `.github/workflows/` we will create a file name `pipeline.yaml` and use the following code.
+
+```yaml
+name: cicd
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v6.0.2
+
+    - name: docker login
+      uses: docker/login-action@v4.0.0
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: generate image tag
+      id: tag
+      run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+      
+    - name: build and push
+      uses: docker/build-push-action@v7.0.0
+      with:
+        push: true
+        context: ./app/
+        tags: spaul76/simple-app:${{ steps.tag.outputs.tag }}
+       
+  deploy:
+    runs-on: self-hosted
+    name: deploy
+    needs: build 
+
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v6.0.2
+
+    - name: save kubeconfig
+      run: |
+        mkdir .kube
+        touch .kube/config
+        echo "${{ secrets.KUBECONFIG }}" > .kube/config
+
+    - name: deploy with helm
+      env: 
+        KUBECONFIG: .kube/config
+      run: helm upgrade app app_chart --namespace dev --set deployment.pod.container.tag=${{ needs.build.outputs.image-tag }}
+```
+
+Here we are using our jump server as self hosted github runner.
+
+### Add Github Secrets
+
+Under `Repository > Settings > Secrets and Variables > Actions` we will add the following as our repository secrets.
+- docker username
+- docker password
+- kubeconfig file contents
+
+We are using these secrets in our pipeline.
+
+![alt](screenshots/2026-03-19-232029_841x308_scrot.png)
+
+### Automated build and deploy
+
+On new commits on main branch the pipeline will trigger.
+
+![alt](screenshots/2026-03-19-233337_870x444_scrot.png)
